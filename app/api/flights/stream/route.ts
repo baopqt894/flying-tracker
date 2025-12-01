@@ -1,12 +1,44 @@
 import type { NextRequest } from "next/server"
 
+// Vercel config
+export const maxDuration = 60
+export const dynamic = "force-dynamic"
+
+// Cache for fallback
+let cachedData: any = { states: [], time: Date.now() / 1000 }
+
+// Fetch with timeout
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 8000): Promise<Response> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    })
+    return response
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
 async function fetchFlights() {
   try {
-    const response = await fetch("https://opensky-network.org/api/states/all", {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-    })
-    if (!response.ok) return { states: [], time: Date.now() / 1000 }
+    const response = await fetchWithTimeout(
+      "https://opensky-network.org/api/states/all",
+      {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      },
+      8000
+    )
+    
+    if (!response.ok) {
+      console.log("OpenSky API returned:", response.status)
+      return cachedData
+    }
+    
     const data = await response.json()
     // Lọc các state có latitude/longitude hợp lệ
     const filteredStates = (data.states || []).filter(
@@ -16,9 +48,13 @@ async function fetchFlights() {
         !isNaN(raw[5]) &&
         !isNaN(raw[6])
     )
-    return { ...data, states: filteredStates }
-  } catch {
-    return { states: [], time: Date.now() / 1000 }
+    
+    const result = { ...data, states: filteredStates }
+    cachedData = result // Update cache
+    return result
+  } catch (error: any) {
+    console.error("Fetch flights error:", error.message)
+    return cachedData // Return cached data on error
   }
 }
 
