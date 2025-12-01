@@ -14,6 +14,8 @@ let tokenCache: Record<"primary" | "secondary", { token: string | null; expiry: 
 let cachedFlights: any[] = []
 let cacheTime: number = 0
 const CACHE_TTL = 60 * 1000 // 1 minute cache
+const CACHE_TTL_MS = CACHE_TTL // already defined above
+let refreshing = false
 
 // Fetch with timeout wrapper
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 8000): Promise<Response> {
@@ -173,6 +175,66 @@ function mapAirportFlight(raw: any) {
   }
 }
 
+// Refresh cache in background (fire-and-forget) to avoid blocking requests on Vercel
+async function refreshFlights(force = false) {
+  if (refreshing && !force) return
+  refreshing = true
+  try {
+    // Try the same pipeline used below but with shorter timeouts and fewer retries
+    let headers: Record<string, string> = pickAuthHeadersForStates(0)
+    let flightsResp = await fetchWithRetry(
+      "https://opensky-network.org/api/states/all",
+      { headers, cache: "no-store" },
+      1
+    ).catch(() => null)
+
+    if (flightsResp && (flightsResp.status === 429 || flightsResp.status === 403)) {
+      headers = pickAuthHeadersForStates(1)
+      flightsResp = await fetchWithRetry(
+        "https://opensky-network.org/api/states/all",
+        { headers, cache: "no-store" },
+        1
+      ).catch(() => null)
+    }
+
+    if (flightsResp && (flightsResp.status === 429 || flightsResp.status === 403)) {
+      headers = pickAuthHeadersForStates(2)
+      flightsResp = await fetchWithRetry(
+        "https://opensky-network.org/api/states/all",
+        { headers, cache: "no-store" },
+        1
+      ).catch(() => null)
+    }
+
+    // Get a token locally for the bearer fallback (do not rely on outer scope)
+    const token = await getAccessToken()
+    if ((!flightsResp || !flightsResp.ok) && token) {
+      try {
+        const bearerResp = await fetchWithRetry(
+          "https://opensky-network.org/api/states/all",
+          { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } },
+          1
+        )
+        if (bearerResp && bearerResp.ok) flightsResp = bearerResp
+      } catch {}
+    }
+
+    if (flightsResp && flightsResp.ok) {
+      const data = await flightsResp.json()
+      const mappedFlights = (data.states || [])
+        .filter((raw: any[]) => typeof raw[5] === "number" && typeof raw[6] === "number" && !isNaN(raw[5]) && !isNaN(raw[6]))
+        .map(mapStateVector)
+
+      cachedFlights = mappedFlights
+      cacheTime = Date.now()
+    }
+  } catch (e) {
+    // ignore; keep existing cache
+  } finally {
+    refreshing = false
+  }
+}
+
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url)
@@ -271,7 +333,23 @@ export async function GET(request: NextRequest) {
 
     // Default: fetch all flights (state vectors)
     try {
-      // Try anonymous first, then primary/secondary Basic Auth on 429/403, then Bearer if available
+      // If we have recent cached data, return immediately to avoid Vercel timeouts
+      const now = Date.now()
+      if (cachedFlights.length > 0 && now - cacheTime < CACHE_TTL_MS) {
+        // trigger refresh in background if nearing staleness
+        if (now - cacheTime > CACHE_TTL_MS * 0.5) {
+          void refreshFlights()
+        }
+        return NextResponse.json({ flights: cachedFlights, time: Math.floor(cacheTime / 1000), cached: true })
+      }
+
+      // If we have stale cache, return it immediately and refresh in background
+      if (cachedFlights.length > 0) {
+        void refreshFlights()
+        return NextResponse.json({ flights: cachedFlights, time: Math.floor(cacheTime / 1000), cached: true })
+      }
+
+      // No cache -> perform normal fetch but keep timeouts low to avoid long-running function
       let headers: Record<string, string> = pickAuthHeadersForStates(0)
       let flightsResp = await fetchWithRetry(
         "https://opensky-network.org/api/states/all",
@@ -298,12 +376,11 @@ export async function GET(request: NextRequest) {
       }
 
       if (!flightsResp.ok) {
-        // As a final attempt, if we have a token, try bearer on states/all (some deployments accept it)
         if (accessToken) {
           const bearerResp = await fetchWithRetry(
             "https://opensky-network.org/api/states/all",
             { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } },
-            0
+            1
           )
           if (bearerResp.ok) flightsResp = bearerResp
         }
