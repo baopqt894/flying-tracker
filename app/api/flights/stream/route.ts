@@ -7,6 +7,32 @@ export const dynamic = "force-dynamic"
 // Cache for fallback
 let cachedData: any = { states: [], time: Date.now() / 1000 }
 
+function getUserPass(prefix = ""): { username?: string; password?: string } {
+  const username = process.env[`OPENSKY_USERNAME${prefix}` as any] || process.env[`NEXT_PUBLIC_OPENSKY_USERNAME${prefix}` as any]
+  const password = process.env[`OPENSKY_PASSWORD${prefix}` as any] || process.env[`NEXT_PUBLIC_OPENSKY_PASSWORD${prefix}` as any]
+  return { username, password }
+}
+
+function buildBasicAuthHeader(username?: string, password?: string): Record<string, string> | undefined {
+  if (!username || !password) return undefined
+  const encoded = Buffer.from(`${username}:${password}`).toString("base64")
+  return { Authorization: `Basic ${encoded}` }
+}
+
+function buildHeaders(stage: 0 | 1 | 2) {
+  // 0: anonymous, 1: primary basic, 2: secondary basic
+  const base: Record<string, string> = { Accept: "application/json" }
+  if (stage === 1) {
+    const { username, password } = getUserPass("")
+    return { ...base, ...(buildBasicAuthHeader(username, password) || {}) }
+  }
+  if (stage === 2) {
+    const { username, password } = getUserPass("1")
+    return { ...base, ...(buildBasicAuthHeader(username, password) || {}) }
+  }
+  return base
+}
+
 // Fetch with timeout
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 8000): Promise<Response> {
   const controller = new AbortController()
@@ -25,15 +51,34 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout 
 
 async function fetchFlights() {
   try {
-    const response = await fetchWithTimeout(
+    // Try anonymous first
+    let headers = buildHeaders(0)
+    let response = await fetchWithTimeout(
       "https://opensky-network.org/api/states/all",
-      {
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      },
+      { headers, cache: "no-store" },
       8000
     )
-    
+
+    // If rate-limited, try primary basic
+    if (response.status === 429 || response.status === 403) {
+      headers = buildHeaders(1)
+      response = await fetchWithTimeout(
+        "https://opensky-network.org/api/states/all",
+        { headers, cache: "no-store" },
+        7000
+      )
+    }
+
+    // If still rate-limited, try secondary basic
+    if (response.status === 429 || response.status === 403) {
+      headers = buildHeaders(2)
+      response = await fetchWithTimeout(
+        "https://opensky-network.org/api/states/all",
+        { headers, cache: "no-store" },
+        7000
+      )
+    }
+
     if (!response.ok) {
       console.log("OpenSky API returned:", response.status)
       return cachedData

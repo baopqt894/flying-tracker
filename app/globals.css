@@ -3,6 +3,9 @@
 
 /* Leaflet CSS */
 @import 'leaflet/dist/leaflet.css';
+/* Marker Cluster CSS */
+@import 'leaflet.markercluster/dist/MarkerCluster.css';
+@import 'leaflet.markercluster/dist/MarkerCluster.Default.css';
 
 @custom-variant dark (&:is(.dark *));
 

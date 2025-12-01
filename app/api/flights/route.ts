@@ -4,9 +4,11 @@ import { NextResponse, NextRequest } from "next/server"
 export const maxDuration = 30 // Tăng timeout lên 30s cho Pro plan, 10s cho Free
 export const dynamic = "force-dynamic"
 
-// Token caching
-let cachedToken: string | null = null
-let tokenExpiry: number = 0
+// Token cache (primary/secondary)
+let tokenCache: Record<"primary" | "secondary", { token: string | null; expiry: number }> = {
+  primary: { token: null, expiry: 0 },
+  secondary: { token: null, expiry: 0 },
+}
 
 // Cache cho flight data để fallback khi API fail
 let cachedFlights: any[] = []
@@ -35,14 +37,12 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 
   
   for (let i = 0; i <= retries; i++) {
     try {
-      // Giảm timeout cho mỗi lần retry
       const timeout = i === 0 ? 8000 : 5000
       return await fetchWithTimeout(url, options, timeout)
     } catch (error: any) {
       lastError = error
-      console.log(`Fetch attempt ${i + 1} failed:`, error.message)
       if (i < retries) {
-        await new Promise(r => setTimeout(r, 500)) // Wait 500ms before retry
+        await new Promise(r => setTimeout(r, 500))
       }
     }
   }
@@ -50,19 +50,32 @@ async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 
   throw lastError
 }
 
-async function getAccessToken(): Promise<string | null> {
-  // Return cached token if still valid (with 5 min buffer)
-  if (cachedToken && Date.now() < tokenExpiry - 5 * 60 * 1000) {
-    return cachedToken
-  }
+function getEnvPair(prefix = ""): { clientId?: string; clientSecret?: string } {
+  const id = process.env[`OPENSKY_CLIENT_ID${prefix}` as any] || process.env[`NEXT_PUBLIC_OPENSKY_CLIENT_ID${prefix}` as any]
+  const secret = process.env[`OPENSKY_CLIENT_SECRET${prefix}` as any] || process.env[`NEXT_PUBLIC_OPENSKY_CLIENT_SECRET${prefix}` as any]
+  return { clientId: id, clientSecret: secret }
+}
 
-  // Check if credentials are available
-  const clientId = process.env.OPENSKY_CLIENT_ID || process.env.NEXT_PUBLIC_OPENSKY_CLIENT_ID
-  const clientSecret = process.env.OPENSKY_CLIENT_SECRET || process.env.NEXT_PUBLIC_OPENSKY_CLIENT_SECRET
-  
-  if (!clientId || !clientSecret) {
-    console.log("OpenSky credentials not configured, using anonymous access")
-    return null
+function getUserPass(prefix = ""): { username?: string; password?: string } {
+  const username = process.env[`OPENSKY_USERNAME${prefix}` as any] || process.env[`NEXT_PUBLIC_OPENSKY_USERNAME${prefix}` as any]
+  const password = process.env[`OPENSKY_PASSWORD${prefix}` as any] || process.env[`NEXT_PUBLIC_OPENSKY_PASSWORD${prefix}` as any]
+  return { username, password }
+}
+
+function buildBasicAuthHeader(username?: string, password?: string): Record<string, string> | undefined {
+  if (!username || !password) return undefined
+  const encoded = Buffer.from(`${username}:${password}`).toString("base64")
+  return { Authorization: `Basic ${encoded}` }
+}
+
+async function fetchToken(which: "primary" | "secondary"): Promise<string | null> {
+  const { clientId, clientSecret } = which === "primary" ? getEnvPair("") : getEnvPair("1")
+  if (!clientId || !clientSecret) return null
+
+  // Return cached token if still valid (with 5 min buffer)
+  const cached = tokenCache[which]
+  if (cached.token && Date.now() < cached.expiry - 5 * 60 * 1000) {
+    return cached.token
   }
 
   try {
@@ -70,7 +83,7 @@ async function getAccessToken(): Promise<string | null> {
     params.append("grant_type", "client_credentials")
     params.append("client_id", clientId)
     params.append("client_secret", clientSecret)
-    
+
     const tokenResp = await fetchWithTimeout(
       "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
       {
@@ -78,23 +91,46 @@ async function getAccessToken(): Promise<string | null> {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: params.toString(),
       },
-      5000 // 5s timeout for token
+      5000
     )
-    
+
     if (!tokenResp.ok) {
-      console.error("Failed to get OpenSky token:", tokenResp.status)
       return null
     }
-    
+
     const tokenData = await tokenResp.json()
-    cachedToken = tokenData.access_token
-    tokenExpiry = Date.now() + (tokenData.expires_in || 3600) * 1000
-    
-    return cachedToken
-  } catch (error) {
-    console.error("Token fetch error:", error)
+    tokenCache[which] = {
+      token: tokenData.access_token,
+      expiry: Date.now() + (tokenData.expires_in || 3600) * 1000,
+    }
+    return tokenCache[which].token
+  } catch {
     return null
   }
+}
+
+async function getAccessToken(): Promise<string | null> {
+  // Try primary first, then secondary
+  const primary = await fetchToken("primary")
+  if (primary) return primary
+  const secondary = await fetchToken("secondary")
+  return secondary
+}
+
+function pickAuthHeadersForStates(fallbackStage: 0 | 1 | 2): Record<string, string> {
+  // 0: no auth (anonymous); 1: primary basic; 2: secondary basic
+  const base: Record<string, string> = { Accept: "application/json" }
+  if (fallbackStage === 1) {
+    const { username, password } = getUserPass("")
+    const basic = buildBasicAuthHeader(username, password)
+    return { ...base, ...(basic || {}) }
+  }
+  if (fallbackStage === 2) {
+    const { username, password } = getUserPass("1")
+    const basic = buildBasicAuthHeader(username, password)
+    return { ...base, ...(basic || {}) }
+  }
+  return base
 }
 
 function mapStateVector(raw: any[]) {
@@ -151,26 +187,19 @@ export async function GET(request: NextRequest) {
     // Note: OpenSky arrivals/departures API only has historical data (previous day or earlier)
     if (type === "arrivals" && airport) {
       const now = Math.floor(Date.now() / 1000)
-      // Use yesterday's data since OpenSky only has historical data
       const yesterday = now - 24 * 3600
       const twoDaysAgo = now - 2 * 24 * 3600
-      
-      // If provided times are in the future, use historical times instead
+
       let beginTime = begin ? parseInt(begin) : twoDaysAgo
       let endTime = end ? parseInt(end) : yesterday
-      
-      // Ensure we're querying historical data (at least 1 day ago)
+
       if (endTime > yesterday) {
         endTime = yesterday
         beginTime = twoDaysAgo
       }
 
-      console.log(`[Arrivals] airport=${airport}, begin=${beginTime}, end=${endTime}`)
-
       const headers: Record<string, string> = { Accept: "application/json" }
-      if (accessToken) {
-        headers.Authorization = `Bearer ${accessToken}`
-      }
+      if (accessToken) headers.Authorization = `Bearer ${accessToken}`
 
       try {
         const resp = await fetchWithRetry(
@@ -201,26 +230,19 @@ export async function GET(request: NextRequest) {
     // Note: OpenSky arrivals/departures API only has historical data (previous day or earlier)
     if (type === "departures" && airport) {
       const now = Math.floor(Date.now() / 1000)
-      // Use yesterday's data since OpenSky only has historical data
       const yesterday = now - 24 * 3600
       const twoDaysAgo = now - 2 * 24 * 3600
-      
-      // If provided times are in the future, use historical times instead
+
       let beginTime = begin ? parseInt(begin) : twoDaysAgo
       let endTime = end ? parseInt(end) : yesterday
-      
-      // Ensure we're querying historical data (at least 1 day ago)
+
       if (endTime > yesterday) {
         endTime = yesterday
         beginTime = twoDaysAgo
       }
 
-      console.log(`[Departures] airport=${airport}, begin=${beginTime}, end=${endTime}`)
-
       const headers: Record<string, string> = { Accept: "application/json" }
-      if (accessToken) {
-        headers.Authorization = `Bearer ${accessToken}`
-      }
+      if (accessToken) headers.Authorization = `Bearer ${accessToken}`
 
       try {
         const resp = await fetchWithRetry(
@@ -249,26 +271,47 @@ export async function GET(request: NextRequest) {
 
     // Default: fetch all flights (state vectors)
     try {
-      const headers: Record<string, string> = {
-        Accept: "application/json",
-      }
-      
-      // Add auth header only if we have a token
-      if (accessToken) {
-        headers.Authorization = `Bearer ${accessToken}`
-      }
-
-      const flightsResp = await fetchWithRetry(
+      // Try anonymous first, then primary/secondary Basic Auth on 429/403, then Bearer if available
+      let headers: Record<string, string> = pickAuthHeadersForStates(0)
+      let flightsResp = await fetchWithRetry(
         "https://opensky-network.org/api/states/all",
         { headers },
-        2 // 2 retries
+        1
       )
 
+      if (flightsResp.status === 429 || flightsResp.status === 403) {
+        headers = pickAuthHeadersForStates(1)
+        flightsResp = await fetchWithRetry(
+          "https://opensky-network.org/api/states/all",
+          { headers },
+          1
+        )
+      }
+
+      if (flightsResp.status === 429 || flightsResp.status === 403) {
+        headers = pickAuthHeadersForStates(2)
+        flightsResp = await fetchWithRetry(
+          "https://opensky-network.org/api/states/all",
+          { headers },
+          1
+        )
+      }
+
       if (!flightsResp.ok) {
-        console.error("OpenSky API error:", flightsResp.status)
+        // As a final attempt, if we have a token, try bearer on states/all (some deployments accept it)
+        if (accessToken) {
+          const bearerResp = await fetchWithRetry(
+            "https://opensky-network.org/api/states/all",
+            { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } },
+            0
+          )
+          if (bearerResp.ok) flightsResp = bearerResp
+        }
+      }
+
+      if (!flightsResp.ok) {
         // Return cached data if available
         if (cachedFlights.length > 0 && Date.now() - cacheTime < CACHE_TTL * 5) {
-          console.log("Returning cached flights due to API error")
           return NextResponse.json({ 
             flights: cachedFlights, 
             time: cacheTime / 1000,
@@ -294,11 +337,8 @@ export async function GET(request: NextRequest) {
       
       return NextResponse.json({ flights: mappedFlights, time: data.time })
     } catch (fetchError) {
-      console.error("Fetch error:", fetchError)
-      
       // Return cached data as fallback
       if (cachedFlights.length > 0) {
-        console.log("Returning cached flights due to fetch error")
         return NextResponse.json({ 
           flights: cachedFlights, 
           time: cacheTime / 1000,
@@ -309,8 +349,6 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ flights: [], error: "Network error", time: Date.now() / 1000 })
     }
   } catch (error) {
-    console.error("Error fetching flight data:", error)
-    
     // Return cached data as last resort
     if (cachedFlights.length > 0) {
       return NextResponse.json({ 
